@@ -27,6 +27,9 @@
       <sourceFolder url="file://$MODULE_DIR$/target/debug/build/syn-37d6e93655e5ec9f/out" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/target/debug/build/memchr-d06779d8ad273722/out" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/target/debug/build/log-f0aad40e0c53d90e/out" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/target/debug/build/indexmap-912cbd89c143ed33/out" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/target/debug/build/proc-macro-error-2be44275fcc393fd/out" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/target/debug/build/proc-macro-error-attr-373313aa6c7df389/out" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

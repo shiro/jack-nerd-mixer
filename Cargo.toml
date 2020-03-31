@@ -9,3 +9,4 @@ edition = "2018"
 [dependencies]
 jack = { git = "https://github.com/RustAudio/rust-jack.git" }
 dbus = "0.8.2"
+clap = { git = "https://github.com/clap-rs/clap/" }

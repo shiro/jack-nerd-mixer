@@ -1,3 +1,4 @@
+extern crate clap;
 extern crate dbus;
 extern crate jack;
 
@@ -85,6 +86,12 @@ fn host_dbus(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let _matches = clap::App::new("jack-rust-mixer")
+        .version("1.0")
+        .author("shiro <shiro@usagi.io>")
+        .about("A lightweight mixer for jack.")
+        .get_matches();
+
     let dbus_path = "com.jackAutoconnect.jackAutoconnect";
 
     let (handle, stop_signal) = match connect_dbus(dbus_path) {
