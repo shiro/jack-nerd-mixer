@@ -67,7 +67,6 @@ fn host_dbus(
         loop {
             match stop_signal_consumer.try_recv() {
                 Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
-                    println!("Terminating.");
                     break;
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -109,13 +108,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         .register_port("rust_out_2", jack::AudioOut::default())
         .unwrap();
 
+    let gain_factor = 0.2;
+
     let playback_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
-        let out_a_p = out_a.as_mut_slice(ps);
-        let out_b_p = out_b.as_mut_slice(ps);
-        let in_a_p = in_a.as_slice(ps);
-        let in_b_p = in_b.as_slice(ps);
-        out_a_p.clone_from_slice(&in_a_p);
-        out_b_p.clone_from_slice(&in_b_p);
+        if gain_factor == 1.0 {
+            return jack::Control::Continue;
+        }
+
+        for (from, to) in &mut [
+            (in_a.as_slice(ps), out_a.as_mut_slice(ps)),
+            (in_b.as_slice(ps), out_b.as_mut_slice(ps)),
+        ] {
+            let len = to.len();
+            let src = &from[..len];
+
+            for i in 0..len {
+                to[i] = src[i].clone() * gain_factor;
+            }
+        }
+
         jack::Control::Continue
     };
 
