@@ -6,12 +6,17 @@ use dbus::blocking::Connection;
 use dbus::blocking::LocalConnection;
 use dbus::tree::Factory;
 use std::error::Error;
-use std::sync::mpsc;
+use std::str::FromStr;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::{io, thread};
 
-fn connect_dbus(dbus_path: &'static str) -> Result<(), Box<dyn Error>> {
+fn connect_dbus(
+    dbus_path: &'static str,
+    app_state: Arc<Mutex<AppState>>,
+    args: clap::ArgMatches,
+) -> Result<(), Box<dyn Error>> {
     let connection = Connection::new_session()?;
 
     let proxy = connection.with_proxy(
@@ -22,13 +27,24 @@ fn connect_dbus(dbus_path: &'static str) -> Result<(), Box<dyn Error>> {
 
     let (ret,): (i32,) = proxy.method_call(dbus_path, "Hello", ())?;
 
+    if let Some(gain_factor) = args
+        .value_of("gain factor")
+        .and_then(|s| <i32 as FromStr>::from_str(s).ok())
+    {
+        let _: () = proxy
+            .method_call(dbus_path, "SetGain", (gain_factor,))
+            .unwrap();
+    }
     println!("got ret: {}", ret);
+
+    // Box::new(Err("soo"))
 
     Ok(())
 }
 
 fn host_dbus(
     dbus_path: &'static str,
+    app_state: Arc<Mutex<AppState>>,
 ) -> Result<(JoinHandle<()>, mpsc::Sender<()>), Box<dyn Error>> {
     let (tx, rx) = mpsc::channel();
     let (stop_signal, stop_signal_consumer) = mpsc::channel();
@@ -51,14 +67,30 @@ fn host_dbus(
 
         let tree = f.tree(()).add(
             f.object_path("/", ()).add(
-                f.interface(dbus_path, ()).add_m(
-                    f.method("Hello", (), move |m| {
-                        let mret = m.msg.method_return().append1(33);
+                f.interface(dbus_path, ())
+                    .add_m(
+                        f.method("Hello", (), move |m| {
+                            let mret = m.msg.method_return().append1(33);
 
-                        Ok(vec![mret])
-                    })
-                    .outarg::<&str, _>("reply"),
-                ),
+                            Ok(vec![mret])
+                        })
+                        .outarg::<&str, _>("reply"),
+                    )
+                    .add_m(f.method("SetGain", (), move |m| {
+                        let gain = match m.msg.read1()? {
+                            n @ 0..=200 => n as f32 / 100.0,
+                            n => return Err(dbus::tree::MethodErr::invalid_arg(&n)),
+                        };
+
+                        println!("setting gain to: {}", gain);
+
+                        app_state
+                            .lock()
+                            .map_err(|_| dbus::tree::MethodErr::invalid_arg(&gain))?
+                            .gain_factor = gain;
+
+                        Ok(vec![m.msg.method_return()])
+                    })),
             ),
         );
         tree.start_receive(&c);
@@ -85,18 +117,34 @@ fn host_dbus(
     Ok((foo, stop_signal))
 }
 
+struct AppState {
+    gain_factor: f32,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    let _matches = clap::App::new("jack-rust-mixer")
+    let matches = clap::App::new("jack-rust-mixer")
         .version("1.0")
         .author("shiro <shiro@usagi.io>")
         .about("A lightweight mixer for jack.")
+        .arg(
+            clap::Arg::with_name("gain factor")
+                .short('g')
+                .long("gain-factor")
+                .value_name("FACTOR")
+                .help("Sets the gain factor from 0 to 100")
+                .takes_value(true),
+        )
         .get_matches();
+
+    let app_state = Arc::new(Mutex::new(AppState { gain_factor: 1.0 }));
 
     let dbus_path = "com.jackAutoconnect.jackAutoconnect";
 
-    let (handle, stop_signal) = match connect_dbus(dbus_path) {
+    let (handle, stop_signal) = match connect_dbus(dbus_path, app_state.clone(), matches) {
         Ok(_) => return Ok(()),
-        Err(_) => host_dbus(dbus_path).expect("error: failed to start dbus service"),
+        Err(_) => {
+            host_dbus(dbus_path, app_state.clone()).expect("error: failed to start dbus service")
+        }
     };
 
     let (client, _) =
@@ -115,12 +163,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .register_port("rust_out_2", jack::AudioOut::default())
         .unwrap();
 
-    let gain_factor = 0.2;
-
     let playback_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
-        if gain_factor == 1.0 {
-            return jack::Control::Continue;
-        }
+        let app_state = match app_state.lock() {
+            Ok(state) => state,
+            _ => return jack::Control::Continue,
+        };
 
         for (from, to) in &mut [
             (in_a.as_slice(ps), out_a.as_mut_slice(ps)),
@@ -130,7 +177,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let src = &from[..len];
 
             for i in 0..len {
-                to[i] = src[i].clone() * gain_factor;
+                to[i] = src[i].clone() * app_state.gain_factor;
             }
         }
 
