@@ -5,7 +5,9 @@ extern crate jack;
 
 use dbus::blocking::Connection;
 use dbus::blocking::LocalConnection;
+use dbus::channel::Channel;
 use dbus::tree::Factory;
+use std::borrow::BorrowMut;
 use std::error::Error;
 use std::str::FromStr;
 use std::sync::{mpsc, Arc, Mutex};
@@ -114,6 +116,74 @@ struct AppState {
     gain_factor: f32,
 }
 
+struct Strip {
+    name: String,
+    channels: Vec<(jack::Port<jack::AudioIn>, jack::Port<jack::AudioOut>)>,
+}
+
+impl Strip {
+    pub fn new(name: &str, client: &mut jack::Client) -> Result<Self, Box<dyn Error>> {
+        let mut ret = Strip {
+            name: String::from(name),
+            channels: vec![],
+        };
+
+        ret.set_channels(2, client)?;
+
+        Ok(ret)
+    }
+
+    pub fn add_channel(&mut self, client: &mut jack::Client) -> Result<(), Box<dyn Error>> {
+        let id = self.channels.len() + 1;
+        self.channels.push((
+            client.register_port(
+                format!("{}-in-{}", &self.name, &id).as_str(),
+                jack::AudioIn::default(),
+            )?,
+            client.register_port(
+                format!("{}-out-{}", &self.name, &id).as_str(),
+                jack::AudioOut::default(),
+            )?,
+        ));
+
+        Ok(())
+    }
+
+    pub fn remove_channel(&mut self, client: &mut jack::Client) -> Result<(), Box<dyn Error>> {
+        if self.channels.len() == 1 {
+            return Err(String::from("cannot unregister last channel").into());
+        }
+
+        let (in_port, out_port) = self.channels.pop().unwrap();
+
+        client.unregister_port(in_port)?;
+        client.unregister_port(out_port)?;
+
+        Ok(())
+    }
+
+    pub fn set_channels(
+        &mut self,
+        num_channels: i32,
+        client: &mut jack::Client,
+    ) -> Result<(), Box<dyn Error>> {
+        let num_channels = match num_channels {
+            n @ 1..=100 => n as usize,
+            _ => return Err(String::from("hello").into()),
+        };
+
+        while self.channels.len() > num_channels {
+            self.remove_channel(client)?;
+        }
+
+        while self.channels.len() < num_channels {
+            self.add_channel(client)?;
+        }
+
+        Ok(())
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let matches = clap::App::new("jack-rust-mixer")
         .version("1.0")
@@ -140,37 +210,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let (client, _) =
+    let (mut client, _) =
         jack::Client::new("jack-rust-mixer", jack::ClientOptions::NO_START_SERVER).unwrap();
 
-    let in_a = client
-        .register_port("rust_in_1", jack::AudioIn::default())
-        .unwrap();
-    let in_b = client
-        .register_port("rust_in_2", jack::AudioIn::default())
-        .unwrap();
-    let mut out_a = client
-        .register_port("rust_out_1", jack::AudioOut::default())
-        .unwrap();
-    let mut out_b = client
-        .register_port("rust_out_2", jack::AudioOut::default())
-        .unwrap();
+    let mut strips = vec![Strip::new("music", client.borrow_mut()).unwrap()];
 
     let playback_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
         let app_state = match app_state.lock() {
             Ok(state) => state,
             _ => return jack::Control::Continue,
         };
+        for strip in &mut strips {
+            for (from, to) in strip
+                .channels
+                .iter_mut()
+                .map(|(from, to)| (from.as_slice(ps), to.as_mut_slice(ps)))
+            {
+                let len = to.len();
+                let src = &from[..len];
 
-        for (from, to) in &mut [
-            (in_a.as_slice(ps), out_a.as_mut_slice(ps)),
-            (in_b.as_slice(ps), out_b.as_mut_slice(ps)),
-        ] {
-            let len = to.len();
-            let src = &from[..len];
-
-            for i in 0..len {
-                to[i] = src[i].clone() * app_state.gain_factor;
+                for i in 0..len {
+                    to[i] = src[i].clone() * app_state.gain_factor;
+                }
             }
         }
 
