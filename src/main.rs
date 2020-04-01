@@ -1,3 +1,4 @@
+#![feature(type_ascription)]
 extern crate clap;
 extern crate dbus;
 extern crate jack;
@@ -25,19 +26,16 @@ fn connect_dbus(
         Duration::from_millis(5000),
     );
 
-    let (ret,): (i32,) = proxy.method_call(dbus_path, "Hello", ())?;
+    proxy.method_call(dbus_path, "Hello", ())?;
 
     if let Some(gain_factor) = args
         .value_of("gain factor")
         .and_then(|s| <i32 as FromStr>::from_str(s).ok())
     {
-        let _: () = proxy
+        proxy
             .method_call(dbus_path, "SetGain", (gain_factor,))
-            .unwrap();
+            .unwrap_or_else(|err| println!("error: {}", err));
     }
-    println!("got ret: {}", ret);
-
-    // Box::new(Err("soo"))
 
     Ok(())
 }
@@ -68,25 +66,20 @@ fn host_dbus(
         let tree = f.tree(()).add(
             f.object_path("/", ()).add(
                 f.interface(dbus_path, ())
-                    .add_m(
-                        f.method("Hello", (), move |m| {
-                            let mret = m.msg.method_return().append1(33);
+                    .add_m(f.method("Hello", (), move |m| {
+                        let mret = m.msg.method_return();
 
-                            Ok(vec![mret])
-                        })
-                        .outarg::<&str, _>("reply"),
-                    )
+                        Ok(vec![mret])
+                    }))
                     .add_m(f.method("SetGain", (), move |m| {
                         let gain = match m.msg.read1()? {
                             n @ 0..=200 => n as f32 / 100.0,
                             n => return Err(dbus::tree::MethodErr::invalid_arg(&n)),
                         };
 
-                        println!("setting gain to: {}", gain);
-
                         app_state
                             .lock()
-                            .map_err(|_| dbus::tree::MethodErr::invalid_arg(&gain))?
+                            .map_err(|_| dbus::tree::MethodErr::failed(&"internal error"))?
                             .gain_factor = gain;
 
                         Ok(vec![m.msg.method_return()])
