@@ -5,9 +5,9 @@ extern crate jack;
 
 use dbus::blocking::Connection;
 use dbus::blocking::LocalConnection;
-use dbus::channel::Channel;
 use dbus::tree::Factory;
 use std::borrow::BorrowMut;
+use std::collections::HashMap;
 use std::error::Error;
 use std::str::FromStr;
 use std::sync::{mpsc, Arc, Mutex};
@@ -82,7 +82,9 @@ fn host_dbus(
                         app_state
                             .lock()
                             .map_err(|_| dbus::tree::MethodErr::failed(&"internal error"))?
-                            .strips[0]
+                            .strips
+                            .get_mut("music")
+                            .unwrap()
                             .gain_factor = gain;
 
                         Ok(vec![m.msg.method_return()])
@@ -114,7 +116,7 @@ fn host_dbus(
 }
 
 struct AppState {
-    strips: Vec<Strip>,
+    strips: HashMap<String, Strip>,
 }
 
 struct Strip {
@@ -206,8 +208,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         jack::Client::new("jack-rust-mixer", jack::ClientOptions::NO_START_SERVER).unwrap();
 
     let app_state = Arc::new(Mutex::new(AppState {
-        strips: vec![Strip::new("music", client.borrow_mut()).unwrap()],
+        strips: HashMap::new(),
     }));
+
+    app_state.lock().unwrap().strips.insert(
+        String::from("music"),
+        Strip::new("music", client.borrow_mut()).unwrap(),
+    );
 
     let dbus_path = "com.jackAutoconnect.jackAutoconnect";
 
@@ -223,7 +230,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(state) => state,
             _ => return jack::Control::Continue,
         };
-        for strip in &mut app_state.strips {
+        for strip in &mut app_state.strips.values_mut() {
             for (from, to) in strip
                 .channels
                 .iter_mut()
