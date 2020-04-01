@@ -82,6 +82,7 @@ fn host_dbus(
                         app_state
                             .lock()
                             .map_err(|_| dbus::tree::MethodErr::failed(&"internal error"))?
+                            .strips[0]
                             .gain_factor = gain;
 
                         Ok(vec![m.msg.method_return()])
@@ -113,11 +114,12 @@ fn host_dbus(
 }
 
 struct AppState {
-    gain_factor: f32,
+    strips: Vec<Strip>,
 }
 
 struct Strip {
     name: String,
+    gain_factor: f32,
     channels: Vec<(jack::Port<jack::AudioIn>, jack::Port<jack::AudioOut>)>,
 }
 
@@ -125,6 +127,7 @@ impl Strip {
     pub fn new(name: &str, client: &mut jack::Client) -> Result<Self, Box<dyn Error>> {
         let mut ret = Strip {
             name: String::from(name),
+            gain_factor: 1.0,
             channels: vec![],
         };
 
@@ -199,7 +202,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .get_matches();
 
-    let app_state = Arc::new(Mutex::new(AppState { gain_factor: 1.0 }));
+    let (mut client, _) =
+        jack::Client::new("jack-rust-mixer", jack::ClientOptions::NO_START_SERVER).unwrap();
+
+    let app_state = Arc::new(Mutex::new(AppState {
+        strips: vec![Strip::new("music", client.borrow_mut()).unwrap()],
+    }));
 
     let dbus_path = "com.jackAutoconnect.jackAutoconnect";
 
@@ -210,17 +218,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let (mut client, _) =
-        jack::Client::new("jack-rust-mixer", jack::ClientOptions::NO_START_SERVER).unwrap();
-
-    let mut strips = vec![Strip::new("music", client.borrow_mut()).unwrap()];
-
     let playback_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
-        let app_state = match app_state.lock() {
+        let mut app_state = match app_state.lock() {
             Ok(state) => state,
             _ => return jack::Control::Continue,
         };
-        for strip in &mut strips {
+        for strip in &mut app_state.strips {
             for (from, to) in strip
                 .channels
                 .iter_mut()
@@ -230,7 +233,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let src = &from[..len];
 
                 for i in 0..len {
-                    to[i] = src[i].clone() * app_state.gain_factor;
+                    to[i] = src[i].clone() * strip.gain_factor;
                 }
             }
         }
