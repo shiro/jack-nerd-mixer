@@ -1,25 +1,34 @@
 #![feature(type_ascription)]
 extern crate clap;
 extern crate dbus;
+extern crate failure;
 extern crate jack;
 
 use dbus::blocking::Connection;
 use dbus::blocking::LocalConnection;
 use dbus::tree::Factory;
+use failure::Error;
+use failure::{err_msg, format_err};
 use std::borrow::BorrowMut;
 use std::collections::HashMap;
-use std::error::Error;
 use std::str::FromStr;
 use std::sync::{mpsc, Arc, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{sleep, JoinHandle};
 use std::time::Duration;
 use std::{io, thread};
+
+// trait MixerCommand {
+//     fn process(&self, client: jack::Client);
+// }
+
+// type MixerCommand = Box<dyn FnMut(&jack::Client) + Send>;
+type MixerCommand = Box<dyn FnOnce(&jack::Client) + Send>;
 
 fn connect_dbus(
     dbus_path: &'static str,
     app_state: Arc<Mutex<AppState>>,
     args: clap::ArgMatches,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Error> {
     let connection = Connection::new_session()?;
 
     let proxy = connection.with_proxy(
@@ -44,10 +53,19 @@ fn connect_dbus(
 
 fn host_dbus(
     dbus_path: &'static str,
-    app_state: Arc<Mutex<AppState>>,
-) -> Result<(JoinHandle<()>, mpsc::Sender<()>), Box<dyn Error>> {
+    mut app_state: Arc<Mutex<AppState>>,
+) -> Result<
+    (
+        JoinHandle<()>,
+        mpsc::Sender<()>,
+        mpsc::Receiver<MixerCommand>,
+    ),
+    Error,
+> {
     let (tx, rx) = mpsc::channel();
     let (stop_signal, stop_signal_consumer) = mpsc::channel();
+
+    let (queue_sender, queue_receiver) = mpsc::channel::<MixerCommand>();
 
     let foo = thread::spawn(move || {
         let mut c = match LocalConnection::new_session() {
@@ -73,21 +91,45 @@ fn host_dbus(
 
                         Ok(vec![mret])
                     }))
-                    .add_m(f.method("SetGain", (), move |m| {
-                        let gain = match m.msg.read1()? {
-                            n @ 0..=200 => n as f32 / 100.0,
-                            n => return Err(dbus::tree::MethodErr::invalid_arg(&n)),
-                        };
+                    .add_m(f.method("SetGain", (), {
+                        let app_state = app_state.clone();
+                        let queue_sender = queue_sender.clone();
+                        move |m| {
+                            let gain = match m.msg.read1()? {
+                                n @ 0..=200 => n as f32 / 100.0,
+                                n => return Err(dbus::tree::MethodErr::invalid_arg(&n)),
+                            };
 
-                        app_state
-                            .lock()
-                            .map_err(|_| dbus::tree::MethodErr::failed(&"internal error"))?
-                            .strips
-                            .get_mut("music")
-                            .unwrap()
-                            .gain_factor = gain;
+                            let l = app_state.clone();
+                            let _ = queue_sender.send(Box::new(move |client: &jack::Client| {
+                                let _ = l.lock().unwrap().addStrip(&"somename", client);
+                                println!("{}", 0);
+                            }));
 
-                        Ok(vec![m.msg.method_return()])
+                            // app_state
+                            //     .lock()
+                            //     .map_err(|_| dbus::tree::MethodErr::failed(&"internal error"))?
+                            //     .strips
+                            //     .get_mut("music")
+                            //     .unwrap()
+                            //     .gain_factor = gain;
+
+                            Ok(vec![m.msg.method_return()])
+                        }
+                    }))
+                    .add_m(f.method("AddStrip", (), {
+                        let app_state = app_state.clone();
+                        move |m| {
+                            let name: &str = m.msg.read1()?;
+
+                            // app_state
+                            //     .lock()
+                            //     .map_err(|e| <Error>::from(e))
+                            //     .and_then(|mut state| state.addStrip(name, client))
+                            //     .map_err(|_| dbus::tree::MethodErr::failed(&"internal error"))?;
+
+                            Ok(vec![m.msg.method_return()])
+                        }
                     })),
             ),
         );
@@ -112,11 +154,24 @@ fn host_dbus(
         .and_then(|res| res.ok())
         .expect("error: failed to start dbus service");
 
-    Ok((foo, stop_signal))
+    Ok((foo, stop_signal, queue_receiver))
 }
 
 struct AppState {
     strips: HashMap<String, Strip>,
+}
+
+impl AppState {
+    pub fn addStrip(&mut self, name: &'static str, client: &jack::Client) -> Result<(), Error> {
+        if self.strips.contains_key(name) {
+            return Err(err_msg("strip already exists"));
+        }
+
+        let strip = Strip::new(name, client)?;
+        self.strips.insert(name.parse().unwrap(), strip);
+
+        Ok(())
+    }
 }
 
 struct Strip {
@@ -126,7 +181,7 @@ struct Strip {
 }
 
 impl Strip {
-    pub fn new(name: &str, client: &mut jack::Client) -> Result<Self, Box<dyn Error>> {
+    pub fn new(name: &str, client: &jack::Client) -> Result<Self, Error> {
         let mut ret = Strip {
             name: String::from(name),
             gain_factor: 1.0,
@@ -138,7 +193,7 @@ impl Strip {
         Ok(ret)
     }
 
-    pub fn add_channel(&mut self, client: &mut jack::Client) -> Result<(), Box<dyn Error>> {
+    pub fn add_channel(&mut self, client: &jack::Client) -> Result<(), Error> {
         let id = self.channels.len() + 1;
         self.channels.push((
             client.register_port(
@@ -154,9 +209,9 @@ impl Strip {
         Ok(())
     }
 
-    pub fn remove_channel(&mut self, client: &mut jack::Client) -> Result<(), Box<dyn Error>> {
+    pub fn remove_channel(&mut self, client: &jack::Client) -> Result<(), Error> {
         if self.channels.len() == 1 {
-            return Err(String::from("cannot unregister last channel").into());
+            return Err(err_msg("cannot unregister last channel"));
         }
 
         let (in_port, out_port) = self.channels.pop().unwrap();
@@ -167,14 +222,10 @@ impl Strip {
         Ok(())
     }
 
-    pub fn set_channels(
-        &mut self,
-        num_channels: i32,
-        client: &mut jack::Client,
-    ) -> Result<(), Box<dyn Error>> {
+    pub fn set_channels(&mut self, num_channels: i32, client: &jack::Client) -> Result<(), Error> {
         let num_channels = match num_channels {
             n @ 1..=100 => n as usize,
-            _ => return Err(String::from("hello").into()),
+            _ => return Err(err_msg("a can have 1-100 channels")),
         };
 
         while self.channels.len() > num_channels {
@@ -189,7 +240,7 @@ impl Strip {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Error> {
     let matches = clap::App::new("jack-rust-mixer")
         .version("1.0")
         .author("shiro <shiro@usagi.io>")
@@ -218,12 +269,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let dbus_path = "com.jackAutoconnect.jackAutoconnect";
 
-    let (handle, stop_signal) = match connect_dbus(dbus_path, app_state.clone(), matches) {
-        Ok(_) => return Ok(()),
-        Err(_) => {
-            host_dbus(dbus_path, app_state.clone()).expect("error: failed to start dbus service")
-        }
-    };
+    let (handle, stop_signal, command_queue) =
+        match connect_dbus(dbus_path, app_state.clone(), matches) {
+            Ok(_) => return Ok(()),
+            Err(_) => host_dbus(dbus_path, app_state.clone())
+                .expect("error: failed to start dbus service"),
+        };
 
     let playback_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
         let mut app_state = match app_state.lock() {
@@ -253,6 +304,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let active_client = client
         .activate_async(Notifications, jack_process_callback)
         .unwrap();
+
+    let _ = command_queue.recv().unwrap()(active_client.as_client());
 
     println!("Press enter/return to quit...");
     let mut user_input = String::new();
