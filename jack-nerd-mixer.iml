@@ -33,6 +33,10 @@
       <sourceFolder url="file://$MODULE_DIR$/target/debug/build/failure_derive-f3a40aaba1e84749/out" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/target/debug/build/syn-d5998547e80e2bf3/out" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/target/debug/build/backtrace-sys-ced71a7e187a73a2/out" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/target/debug/build/crossbeam-utils-a8e0d50e1ab3dbff/out" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/target/debug/build/maybe-uninit-24dc58d39c1236ce/out" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/target/debug/build/libc-570919750ef2eed8/out" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/target/debug/build/nix-6821749e1c499ab6/out" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

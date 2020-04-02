@@ -12,4 +12,9 @@ dbus = "0.8.2"
 clap = { git = "https://github.com/clap-rs/clap/" }
 failure = "0.1.7"
 enclose = "1.1.8"
+crossbeam-channel = "0.4"
+either = "1.5.3"
+ctrlc = "3.1.4"
+
+
 

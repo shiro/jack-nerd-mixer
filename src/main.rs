@@ -4,19 +4,32 @@ extern crate dbus;
 extern crate failure;
 extern crate jack;
 
+use crate::MixerCommandError::UnknownStrip;
+use crossbeam_channel::unbounded;
 use dbus::blocking::Connection;
 use dbus::blocking::LocalConnection;
 use dbus::tree::Factory;
 use enclose::enclose;
-use failure::Error;
 use failure::{err_msg, format_err};
+use failure::{Error, Fail};
 use std::borrow::BorrowMut;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{sleep, JoinHandle};
 use std::time::Duration;
 use std::{io, thread};
+
+fn generic_dbus_error() -> dbus::tree::MethodErr {
+    ("org.freedesktop.DBus.Error.Failed", "Internal error").into()
+}
+
+#[derive(Debug, Fail)]
+enum MixerCommandError {
+    #[fail(display = "unknown strip: {}", name)]
+    UnknownStrip { name: String },
+}
 
 const DBUS_PATH: &'static str = "com.jackAutoconnect.jackAutoconnect";
 
@@ -25,6 +38,7 @@ enum DbusRoute {
     AddStrip,
     SetGainFactor,
 }
+
 impl DbusRoute {
     fn to_string(&self) -> &'static str {
         match *self {
@@ -37,7 +51,7 @@ impl DbusRoute {
 
 enum MixerCommand {
     AddStrip(String),
-    SetGainFactor(f32),
+    SetGainFactor(String, f32),
 }
 
 fn connect_dbus(args: clap::ArgMatches) -> Result<(), Error> {
@@ -47,20 +61,20 @@ fn connect_dbus(args: clap::ArgMatches) -> Result<(), Error> {
 
     proxy.method_call(DBUS_PATH, DbusRoute::InstanceRunning.to_string(), ())?;
 
-    if let Some(gain_factor) = args
-        .value_of("gain factor")
-        .and_then(|s| <i32 as FromStr>::from_str(s).ok())
-    {
+    if let (Some(name), Ok(gain_factor)) = (
+        args.value_of("strip name"),
+        clap::value_t!(args, "gain factor", i32),
+    ) {
         proxy
             .method_call(
                 DBUS_PATH,
                 DbusRoute::SetGainFactor.to_string(),
-                (gain_factor,),
+                (name, gain_factor),
             )
             .unwrap_or_else(|err| println!("error: {}", err));
     }
 
-    if let Some(name) = args.value_of("add strip") {
+    if let (Some(name), true) = (args.value_of("strip name"), args.is_present("add strip")) {
         proxy
             .method_call(DBUS_PATH, DbusRoute::AddStrip.to_string(), (name,))
             .unwrap_or_else(|err| println!("error: {}", err));
@@ -69,20 +83,21 @@ fn connect_dbus(args: clap::ArgMatches) -> Result<(), Error> {
     Ok(())
 }
 
-fn start_command_worker() -> Result<
-    (
-        JoinHandle<()>,
-        mpsc::Sender<()>,
-        mpsc::Receiver<MixerCommand>,
-    ),
-    Error,
-> {
-    let (tx, rx) = mpsc::channel();
-    let (stop_signal, stop_signal_consumer) = mpsc::channel();
+struct CommandWorkerContext {
+    join_handle: JoinHandle<()>,
+    join_signal_tx: mpsc::Sender<()>,
+    command_rx: mpsc::Receiver<MixerCommand>,
+    response_tx: crossbeam_channel::Sender<Result<(), Error>>,
+}
 
-    let (queue_sender, queue_receiver) = mpsc::channel::<MixerCommand>();
+fn start_command_worker() -> Result<(CommandWorkerContext), Error> {
+    let (command_tx, command_rx) = mpsc::channel();
+    let (response_tx, response_rx) = crossbeam_channel::unbounded::<Result<(), Error>>();
+    let (join_signal_tx, join_signal_rx) = mpsc::channel();
 
-    let worker = thread::spawn(move || {
+    let (tx, worker_status_rx) = mpsc::channel();
+
+    let join_handle = thread::spawn(move || {
         let mut c = match LocalConnection::new_session() {
             Ok(val) => val,
             Err(e) => {
@@ -109,30 +124,64 @@ fn start_command_worker() -> Result<
                         }),
                     )
                     .add_m(f.method(DbusRoute::SetGainFactor.to_string(), (), {
-                        enclose!((queue_sender) move |m| {
-                            let gain = match m.msg.read1()? {
-                                n @ 0..=200 => n as f32 / 100.0,
-                                n => return Err(dbus::tree::MethodErr::invalid_arg(&n)),
-                            };
+                        {
+                            let command_tx = command_tx.clone();
+                            let response_rx = response_rx.clone();
+                            move |m| {
+                                let (name, gain): (&str, i32) = m.msg.read2()?;
 
-                            let _ = queue_sender.send(MixerCommand::SetGainFactor(gain));
+                                let gain = match gain {
+                                    n @ 0..=200 => n as f32 / 100.0,
+                                    n => return Err(dbus::tree::MethodErr::invalid_arg(&n)),
+                                };
 
-                            Ok(vec![m.msg.method_return()])
-                        })
+                                if command_tx
+                                    .send(MixerCommand::SetGainFactor(name.to_owned(), gain))
+                                    .is_err()
+                                {
+                                    return Err(generic_dbus_error());
+                                }
+
+                                if let Err(err) = response_rx
+                                    .recv()
+                                    .map_err(|_| generic_dbus_error())
+                                    .and_then(|m| {
+                                        m.map_err(|e| dbus::tree::MethodErr::failed(&e.to_string()))
+                                    })
+                                {
+                                    return Err(err);
+                                }
+
+                                Ok(vec![m.msg.method_return()])
+                            }
+                        }
                     }))
                     .add_m(f.method(DbusRoute::AddStrip.to_string(), (), {
-                        move |m| {
-                            let name: &str = m.msg.read1()?;
+                        {
+                            let command_tx = command_tx.clone();
+                            let response_rx = response_rx.clone();
+                            move |m| {
+                                let name: &str = m.msg.read1()?;
 
-                            let _ = queue_sender.send(MixerCommand::AddStrip(name.to_owned()));
+                                if command_tx
+                                    .send(MixerCommand::AddStrip(name.to_owned()))
+                                    .is_err()
+                                {
+                                    return Err(generic_dbus_error());
+                                }
 
-                            // app_state
-                            //     .lock()
-                            //     .map_err(|e| <Error>::from(e))
-                            //     .and_then(|mut state| state.add_strip(name, client))
-                            //     .map_err(|_| dbus::tree::MethodErr::failed(&"internal error"))?;
+                                if let Err(err) = response_rx
+                                    .recv()
+                                    .map_err(|_| generic_dbus_error())
+                                    .and_then(|m| {
+                                        m.map_err(|e| dbus::tree::MethodErr::failed(&e.to_string()))
+                                    })
+                                {
+                                    return Err(err);
+                                }
 
-                            Ok(vec![m.msg.method_return()])
+                                Ok(vec![m.msg.method_return()])
+                            }
                         }
                     })),
             ),
@@ -142,7 +191,7 @@ fn start_command_worker() -> Result<
         let _ = tx.send(Ok(()));
 
         loop {
-            match stop_signal_consumer.try_recv() {
+            match join_signal_rx.try_recv() {
                 Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
                     break;
                 }
@@ -153,12 +202,19 @@ fn start_command_worker() -> Result<
         }
     });
 
-    rx.recv()
+    worker_status_rx
+        .recv()
         .ok()
         .and_then(|res| res.ok())
         .expect("error: failed to start dbus service");
 
-    Ok((worker, stop_signal, queue_receiver))
+    // Ok((worker, join_signal_tx, command_rx))
+    Ok(CommandWorkerContext {
+        join_handle,
+        join_signal_tx,
+        command_rx,
+        response_tx,
+    })
 }
 
 struct AppState {
@@ -250,6 +306,14 @@ fn main() -> Result<(), Error> {
         .author("shiro <shiro@usagi.io>")
         .about("A lightweight mixer for jack.")
         .arg(
+            clap::Arg::with_name("strip name")
+                .short('s')
+                .long("strip")
+                .value_name("NAME")
+                .help("Specifies which strip to perform commands on")
+                .takes_value(true),
+        )
+        .arg(
             clap::Arg::with_name("gain factor")
                 .short('g')
                 .long("gain-factor")
@@ -259,14 +323,22 @@ fn main() -> Result<(), Error> {
         )
         .arg(
             clap::Arg::with_name("add strip")
-                .short('s')
+                .short('a')
                 .long("add-strip")
-                .value_name("NAME")
-                .help("Adds a new strip")
-                .takes_value(true),
+                .help("Adds a new strip"),
         )
         .get_matches();
 
+    let stopped = Arc::new(AtomicBool::new(false));
+    {
+        let stopped = stopped.clone();
+
+        let _ = ctrlc::set_handler(move || {
+            stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
+    // TODO fail
     let (mut client, _) =
         jack::Client::new("jack-rust-mixer", jack::ClientOptions::NO_START_SERVER).unwrap();
 
@@ -274,6 +346,7 @@ fn main() -> Result<(), Error> {
         strips: HashMap::new(),
     }));
 
+    // TODO fail
     app_state.lock().unwrap().strips.insert(
         String::from("music"),
         Strip::new(String::from("music"), client.borrow_mut()).unwrap(),
@@ -283,7 +356,7 @@ fn main() -> Result<(), Error> {
         return Ok(());
     }
 
-    let (handle, stop_signal, command_queue) =
+    let command_worker_context =
         start_command_worker().expect("error: failed to start dbus service");
 
     let playback_callback = enclose!((app_state) move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
@@ -315,34 +388,44 @@ fn main() -> Result<(), Error> {
         .activate_async(Notifications, jack_process_callback)
         .unwrap();
 
-    // let _ = command_queue.recv().unwrap()(active_client.as_client());
-    match command_queue.recv().unwrap() {
-        MixerCommand::AddStrip(name) => {
-            let _ = app_state
-                .lock()
-                .unwrap()
-                .add_strip(name, active_client.as_client());
-        }
-        MixerCommand::SetGainFactor(gain_factor) => {
-            app_state
-                .lock()
-                .unwrap()
-                // .map_err(|_| dbus::tree::MethodErr::failed(&"internal error"))?
-                .strips
-                .get_mut("music")
-                .unwrap()
-                .gain_factor = gain_factor;
+    fn process_commands(
+        cmd: &MixerCommand,
+        app_state: Arc<Mutex<AppState>>,
+        client: &jack::Client,
+    ) -> Result<(), Error> {
+        match cmd {
+            MixerCommand::AddStrip(name) => {
+                app_state
+                    .lock()
+                    .map_err(|_| err_msg("internal"))?
+                    .add_strip(name.to_owned(), client)?;
+            }
+            MixerCommand::SetGainFactor(name, gain_factor) => {
+                app_state
+                    .lock()
+                    .map_err(|_| err_msg("internal"))?
+                    .strips
+                    .get_mut(name)
+                    .ok_or(UnknownStrip {
+                        name: String::from(name),
+                    })?
+                    .gain_factor = *gain_factor;
+            }
+        };
+        Ok(())
+    }
+
+    while !stopped.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Ok(cmd) = command_worker_context.command_rx.try_recv() {
+            let res = process_commands(&cmd, app_state.clone(), active_client.as_client());
+            command_worker_context.response_tx.send(res)?;
         }
     }
 
-    println!("Press enter/return to quit...");
-    let mut user_input = String::new();
-    io::stdin().read_line(&mut user_input).ok();
+    active_client.deactivate()?;
 
-    let _ = active_client.deactivate();
-
-    let _ = stop_signal.send(());
-    let _ = handle.join();
+    command_worker_context.join_signal_tx.send(())?;
+    command_worker_context.join_handle.join().unwrap();
     return Ok(());
 }
 
