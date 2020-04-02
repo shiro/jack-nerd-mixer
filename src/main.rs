@@ -18,44 +18,58 @@ use std::thread::{sleep, JoinHandle};
 use std::time::Duration;
 use std::{io, thread};
 
+const DBUS_PATH: &'static str = "com.jackAutoconnect.jackAutoconnect";
+
+enum DbusRoute {
+    InstanceRunning,
+    AddStrip,
+    SetGainFactor,
+}
+impl DbusRoute {
+    fn to_string(&self) -> &'static str {
+        match *self {
+            DbusRoute::InstanceRunning => "InstanceRunning",
+            DbusRoute::AddStrip => "AddStrip",
+            DbusRoute::SetGainFactor => "SetGainFactor",
+        }
+    }
+}
+
 enum MixerCommand {
     AddStrip(String),
     SetGainFactor(f32),
 }
 
-fn connect_dbus(dbus_path: &'static str, args: clap::ArgMatches) -> Result<(), Error> {
+fn connect_dbus(args: clap::ArgMatches) -> Result<(), Error> {
     let connection = Connection::new_session()?;
 
-    let proxy = connection.with_proxy(
-        "com.jackAutoconnect.jackAutoconnect",
-        "/",
-        Duration::from_millis(5000),
-    );
+    let proxy = connection.with_proxy(DBUS_PATH, "/", Duration::from_millis(5000));
 
-    proxy.method_call(dbus_path, "Hello", ())?;
+    proxy.method_call(DBUS_PATH, DbusRoute::InstanceRunning.to_string(), ())?;
 
     if let Some(gain_factor) = args
         .value_of("gain factor")
         .and_then(|s| <i32 as FromStr>::from_str(s).ok())
     {
         proxy
-            .method_call(dbus_path, "SetGain", (gain_factor,))
+            .method_call(
+                DBUS_PATH,
+                DbusRoute::SetGainFactor.to_string(),
+                (gain_factor,),
+            )
             .unwrap_or_else(|err| println!("error: {}", err));
     }
 
     if let Some(name) = args.value_of("add strip") {
         proxy
-            .method_call(dbus_path, "AddStrip", (name,))
+            .method_call(DBUS_PATH, DbusRoute::AddStrip.to_string(), (name,))
             .unwrap_or_else(|err| println!("error: {}", err));
     }
 
     Ok(())
 }
 
-fn host_dbus(
-    dbus_path: &'static str,
-    mut app_state: Arc<Mutex<AppState>>,
-) -> Result<
+fn start_command_worker() -> Result<
     (
         JoinHandle<()>,
         mpsc::Sender<()>,
@@ -68,7 +82,7 @@ fn host_dbus(
 
     let (queue_sender, queue_receiver) = mpsc::channel::<MixerCommand>();
 
-    let foo = thread::spawn(move || {
+    let worker = thread::spawn(move || {
         let mut c = match LocalConnection::new_session() {
             Ok(val) => val,
             Err(e) => {
@@ -77,7 +91,7 @@ fn host_dbus(
             }
         };
 
-        if let Err(e) = c.request_name("com.jackAutoconnect.jackAutoconnect", false, true, false) {
+        if let Err(e) = c.request_name(DBUS_PATH, false, true, false) {
             let _ = tx.send(Err(e));
             return;
         }
@@ -86,13 +100,15 @@ fn host_dbus(
 
         let tree = f.tree(()).add(
             f.object_path("/", ()).add(
-                f.interface(dbus_path, ())
-                    .add_m(f.method("Hello", (), move |m| {
-                        let mret = m.msg.method_return();
+                f.interface(DBUS_PATH, ())
+                    .add_m(
+                        f.method(DbusRoute::InstanceRunning.to_string(), (), move |m| {
+                            let mret = m.msg.method_return();
 
-                        Ok(vec![mret])
-                    }))
-                    .add_m(f.method("SetGain", (), {
+                            Ok(vec![mret])
+                        }),
+                    )
+                    .add_m(f.method(DbusRoute::SetGainFactor.to_string(), (), {
                         enclose!((queue_sender) move |m| {
                             let gain = match m.msg.read1()? {
                                 n @ 0..=200 => n as f32 / 100.0,
@@ -104,7 +120,7 @@ fn host_dbus(
                             Ok(vec![m.msg.method_return()])
                         })
                     }))
-                    .add_m(f.method("AddStrip", (), {
+                    .add_m(f.method(DbusRoute::AddStrip.to_string(), (), {
                         move |m| {
                             let name: &str = m.msg.read1()?;
 
@@ -113,7 +129,7 @@ fn host_dbus(
                             // app_state
                             //     .lock()
                             //     .map_err(|e| <Error>::from(e))
-                            //     .and_then(|mut state| state.addStrip(name, client))
+                            //     .and_then(|mut state| state.add_strip(name, client))
                             //     .map_err(|_| dbus::tree::MethodErr::failed(&"internal error"))?;
 
                             Ok(vec![m.msg.method_return()])
@@ -142,7 +158,7 @@ fn host_dbus(
         .and_then(|res| res.ok())
         .expect("error: failed to start dbus service");
 
-    Ok((foo, stop_signal, queue_receiver))
+    Ok((worker, stop_signal, queue_receiver))
 }
 
 struct AppState {
@@ -150,7 +166,7 @@ struct AppState {
 }
 
 impl AppState {
-    pub fn addStrip(&mut self, name: String, client: &jack::Client) -> Result<(), Error> {
+    pub fn add_strip(&mut self, name: String, client: &jack::Client) -> Result<(), Error> {
         if self.strips.contains_key(&name) {
             return Err(err_msg("strip already exists"));
         }
@@ -229,7 +245,7 @@ impl Strip {
 }
 
 fn main() -> Result<(), Error> {
-    let matches = clap::App::new("jack-rust-mixer")
+    let args = clap::App::new("jack-rust-mixer")
         .version("1.0")
         .author("shiro <shiro@usagi.io>")
         .about("A lightweight mixer for jack.")
@@ -263,14 +279,12 @@ fn main() -> Result<(), Error> {
         Strip::new(String::from("music"), client.borrow_mut()).unwrap(),
     );
 
-    let dbus_path = "com.jackAutoconnect.jackAutoconnect";
+    if let Ok(_) = connect_dbus(args) {
+        return Ok(());
+    }
 
-    let (handle, stop_signal, command_queue) = match connect_dbus(dbus_path, matches) {
-        Ok(_) => return Ok(()),
-        Err(_) => {
-            host_dbus(dbus_path, app_state.clone()).expect("error: failed to start dbus service")
-        }
-    };
+    let (handle, stop_signal, command_queue) =
+        start_command_worker().expect("error: failed to start dbus service");
 
     let playback_callback = enclose!((app_state) move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
         let mut app_state = match app_state.lock() {
@@ -307,7 +321,7 @@ fn main() -> Result<(), Error> {
             let _ = app_state
                 .lock()
                 .unwrap()
-                .addStrip(name, active_client.as_client());
+                .add_strip(name, active_client.as_client());
         }
         MixerCommand::SetGainFactor(gain_factor) => {
             app_state
