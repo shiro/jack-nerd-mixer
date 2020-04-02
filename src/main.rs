@@ -7,6 +7,7 @@ extern crate jack;
 use dbus::blocking::Connection;
 use dbus::blocking::LocalConnection;
 use dbus::tree::Factory;
+use enclose::enclose;
 use failure::Error;
 use failure::{err_msg, format_err};
 use std::borrow::BorrowMut;
@@ -17,18 +18,12 @@ use std::thread::{sleep, JoinHandle};
 use std::time::Duration;
 use std::{io, thread};
 
-// trait MixerCommand {
-//     fn process(&self, client: jack::Client);
-// }
+enum MixerCommand {
+    AddStrip(String),
+    SetGainFactor(f32),
+}
 
-// type MixerCommand = Box<dyn FnMut(&jack::Client) + Send>;
-type MixerCommand = Box<dyn FnOnce(&jack::Client) + Send>;
-
-fn connect_dbus(
-    dbus_path: &'static str,
-    app_state: Arc<Mutex<AppState>>,
-    args: clap::ArgMatches,
-) -> Result<(), Error> {
+fn connect_dbus(dbus_path: &'static str, args: clap::ArgMatches) -> Result<(), Error> {
     let connection = Connection::new_session()?;
 
     let proxy = connection.with_proxy(
@@ -45,6 +40,12 @@ fn connect_dbus(
     {
         proxy
             .method_call(dbus_path, "SetGain", (gain_factor,))
+            .unwrap_or_else(|err| println!("error: {}", err));
+    }
+
+    if let Some(name) = args.value_of("add strip") {
+        proxy
+            .method_call(dbus_path, "AddStrip", (name,))
             .unwrap_or_else(|err| println!("error: {}", err));
     }
 
@@ -92,35 +93,22 @@ fn host_dbus(
                         Ok(vec![mret])
                     }))
                     .add_m(f.method("SetGain", (), {
-                        let app_state = app_state.clone();
-                        let queue_sender = queue_sender.clone();
-                        move |m| {
+                        enclose!((queue_sender) move |m| {
                             let gain = match m.msg.read1()? {
                                 n @ 0..=200 => n as f32 / 100.0,
                                 n => return Err(dbus::tree::MethodErr::invalid_arg(&n)),
                             };
 
-                            let l = app_state.clone();
-                            let _ = queue_sender.send(Box::new(move |client: &jack::Client| {
-                                let _ = l.lock().unwrap().addStrip(&"somename", client);
-                                println!("{}", 0);
-                            }));
-
-                            // app_state
-                            //     .lock()
-                            //     .map_err(|_| dbus::tree::MethodErr::failed(&"internal error"))?
-                            //     .strips
-                            //     .get_mut("music")
-                            //     .unwrap()
-                            //     .gain_factor = gain;
+                            let _ = queue_sender.send(MixerCommand::SetGainFactor(gain));
 
                             Ok(vec![m.msg.method_return()])
-                        }
+                        })
                     }))
                     .add_m(f.method("AddStrip", (), {
-                        let app_state = app_state.clone();
                         move |m| {
                             let name: &str = m.msg.read1()?;
+
+                            let _ = queue_sender.send(MixerCommand::AddStrip(name.to_owned()));
 
                             // app_state
                             //     .lock()
@@ -162,13 +150,13 @@ struct AppState {
 }
 
 impl AppState {
-    pub fn addStrip(&mut self, name: &'static str, client: &jack::Client) -> Result<(), Error> {
-        if self.strips.contains_key(name) {
+    pub fn addStrip(&mut self, name: String, client: &jack::Client) -> Result<(), Error> {
+        if self.strips.contains_key(&name) {
             return Err(err_msg("strip already exists"));
         }
 
-        let strip = Strip::new(name, client)?;
-        self.strips.insert(name.parse().unwrap(), strip);
+        let strip = Strip::new(name.clone(), client)?;
+        self.strips.insert(name, strip);
 
         Ok(())
     }
@@ -181,7 +169,7 @@ struct Strip {
 }
 
 impl Strip {
-    pub fn new(name: &str, client: &jack::Client) -> Result<Self, Error> {
+    pub fn new(name: String, client: &jack::Client) -> Result<Self, Error> {
         let mut ret = Strip {
             name: String::from(name),
             gain_factor: 1.0,
@@ -253,6 +241,14 @@ fn main() -> Result<(), Error> {
                 .help("Sets the gain factor from 0 to 100")
                 .takes_value(true),
         )
+        .arg(
+            clap::Arg::with_name("add strip")
+                .short('s')
+                .long("add-strip")
+                .value_name("NAME")
+                .help("Adds a new strip")
+                .takes_value(true),
+        )
         .get_matches();
 
     let (mut client, _) =
@@ -264,19 +260,19 @@ fn main() -> Result<(), Error> {
 
     app_state.lock().unwrap().strips.insert(
         String::from("music"),
-        Strip::new("music", client.borrow_mut()).unwrap(),
+        Strip::new(String::from("music"), client.borrow_mut()).unwrap(),
     );
 
     let dbus_path = "com.jackAutoconnect.jackAutoconnect";
 
-    let (handle, stop_signal, command_queue) =
-        match connect_dbus(dbus_path, app_state.clone(), matches) {
-            Ok(_) => return Ok(()),
-            Err(_) => host_dbus(dbus_path, app_state.clone())
-                .expect("error: failed to start dbus service"),
-        };
+    let (handle, stop_signal, command_queue) = match connect_dbus(dbus_path, matches) {
+        Ok(_) => return Ok(()),
+        Err(_) => {
+            host_dbus(dbus_path, app_state.clone()).expect("error: failed to start dbus service")
+        }
+    };
 
-    let playback_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
+    let playback_callback = enclose!((app_state) move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
         let mut app_state = match app_state.lock() {
             Ok(state) => state,
             _ => return jack::Control::Continue,
@@ -297,7 +293,7 @@ fn main() -> Result<(), Error> {
         }
 
         jack::Control::Continue
-    };
+    });
 
     let jack_process_callback = jack::ClosureProcessHandler::new(playback_callback);
 
@@ -305,7 +301,25 @@ fn main() -> Result<(), Error> {
         .activate_async(Notifications, jack_process_callback)
         .unwrap();
 
-    let _ = command_queue.recv().unwrap()(active_client.as_client());
+    // let _ = command_queue.recv().unwrap()(active_client.as_client());
+    match command_queue.recv().unwrap() {
+        MixerCommand::AddStrip(name) => {
+            let _ = app_state
+                .lock()
+                .unwrap()
+                .addStrip(name, active_client.as_client());
+        }
+        MixerCommand::SetGainFactor(gain_factor) => {
+            app_state
+                .lock()
+                .unwrap()
+                // .map_err(|_| dbus::tree::MethodErr::failed(&"internal error"))?
+                .strips
+                .get_mut("music")
+                .unwrap()
+                .gain_factor = gain_factor;
+        }
+    }
 
     println!("Press enter/return to quit...");
     let mut user_input = String::new();
