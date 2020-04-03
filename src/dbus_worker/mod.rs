@@ -57,6 +57,7 @@ pub(crate) fn connect_dbus(args: args::Args) -> Result<Option<()>, Error> {
             DbusRoute::SetGainFactor.to_string(),
             (name, gain_factor),
         )?;
+        return Ok(Some(()));
     }
 
     if let Args {
@@ -66,6 +67,7 @@ pub(crate) fn connect_dbus(args: args::Args) -> Result<Option<()>, Error> {
     } = args
     {
         proxy.method_call(DBUS_PATH, DbusRoute::AddStrip.to_string(), (name,))?;
+        return Ok(Some(()));
     }
 
     if let Args {
@@ -75,6 +77,7 @@ pub(crate) fn connect_dbus(args: args::Args) -> Result<Option<()>, Error> {
     } = args
     {
         proxy.method_call(DBUS_PATH, DbusRoute::RemoveStrip.to_string(), (name,))?;
+        return Ok(Some(()));
     }
 
     Ok(Some(()))
