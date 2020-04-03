@@ -1,6 +1,5 @@
 use failure::err_msg;
 use failure::Error;
-use std::sync::Mutex;
 
 pub(crate) struct Strip {
     name: String,

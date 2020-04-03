@@ -25,6 +25,12 @@ pub enum MixerCommand {
     AddStrip(String),
     RemoveStrip(String),
     SetGainFactor(String, f32),
+    GetState,
+}
+
+pub enum MixerResponse {
+    EMPTY,
+    STATE(Vec<String>),
 }
 
 struct AppState {
@@ -126,12 +132,12 @@ fn main() -> Result<(), Error> {
         cmd: &MixerCommand,
         app_state: Arc<Mutex<AppState>>,
         client: &jack::Client,
-    ) -> Result<(), Error> {
+    ) -> Result<MixerResponse, Error> {
         match cmd {
             MixerCommand::SetGainFactor(name, gain_factor) => {
                 app_state
                     .lock()
-                    .map_err(|_| err_msg("internal"))?
+                    .map_err(|_| MixerCommandError::Internal)?
                     .strips
                     .get_mut(name)
                     .ok_or(MixerCommandError::UnknownStrip {
@@ -142,17 +148,35 @@ fn main() -> Result<(), Error> {
             MixerCommand::AddStrip(name) => {
                 app_state
                     .lock()
-                    .map_err(|_| err_msg("internal"))?
+                    .map_err(|_| MixerCommandError::Internal)?
                     .add_strip(name.to_owned(), client)?;
             }
             MixerCommand::RemoveStrip(name) => {
                 app_state
                     .lock()
-                    .map_err(|_| err_msg("internal"))?
+                    .map_err(|_| MixerCommandError::Internal)?
                     .remove_strip(name.to_owned(), client)?;
             }
+            MixerCommand::GetState => {
+                let mut strip_meta = vec![];
+
+                for (ch_name, strip) in app_state
+                    .lock()
+                    .map_err(|_| MixerCommandError::Internal)?
+                    .strips
+                    .iter()
+                {
+                    strip_meta.push(format!(
+                        "{}: channels: {} gain-factor: {}",
+                        ch_name,
+                        strip.channels.len(),
+                        strip.gain_factor
+                    ));
+                }
+                return Ok(MixerResponse::STATE(strip_meta));
+            }
         };
-        Ok(())
+        Ok(MixerResponse::EMPTY)
     }
 
     while !stopped.load(std::sync::atomic::Ordering::SeqCst) {

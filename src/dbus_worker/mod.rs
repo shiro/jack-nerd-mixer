@@ -9,7 +9,7 @@ use dbus::tree::Factory;
 use failure::Error;
 
 use crate::args::Args;
-use crate::{args, MixerCommand};
+use crate::{args, MixerCommand, MixerResponse};
 
 fn generic_dbus_error() -> dbus::tree::MethodErr {
     ("org.freedesktop.DBus.Error.Failed", "Internal error").into()
@@ -22,6 +22,7 @@ enum DbusRoute {
     AddStrip,
     RemoveStrip,
     SetGainFactor,
+    GetState,
 }
 
 impl DbusRoute {
@@ -31,6 +32,7 @@ impl DbusRoute {
             DbusRoute::SetGainFactor => "SetGainFactor",
             DbusRoute::AddStrip => "AddStrip",
             DbusRoute::RemoveStrip => "RemoveStrip",
+            DbusRoute::GetState => "GetState",
         }
     }
 }
@@ -80,6 +82,13 @@ pub(crate) fn connect_dbus(args: args::Args) -> Result<Option<()>, Error> {
         return Ok(Some(()));
     }
 
+    let (res,): (Vec<String>,) =
+        proxy.method_call(DBUS_PATH, DbusRoute::GetState.to_string(), ())?;
+
+    for line in res {
+        println!("{}", line);
+    }
+
     Ok(Some(()))
 }
 
@@ -87,32 +96,29 @@ pub struct CommandWorkerContext {
     pub join_handle: JoinHandle<()>,
     pub join_signal_tx: mpsc::Sender<()>,
     pub command_rx: mpsc::Receiver<MixerCommand>,
-    pub response_tx: crossbeam_channel::Sender<Result<(), Error>>,
+    pub response_tx: crossbeam_channel::Sender<Result<MixerResponse, Error>>,
 }
 
 fn handle_mixer_command(
     command_tx: &mpsc::Sender<MixerCommand>,
-    response_rx: &crossbeam_channel::Receiver<Result<(), Error>>,
+    response_rx: &crossbeam_channel::Receiver<Result<MixerResponse, Error>>,
     command: MixerCommand,
-) -> Result<(), dbus::tree::MethodErr> {
+) -> Result<MixerResponse, dbus::tree::MethodErr> {
     if command_tx.send(command).is_err() {
         return Err(generic_dbus_error());
     }
 
-    if let Err(err) = response_rx
+    let res = response_rx
         .recv()
         .map_err(|_| generic_dbus_error())
-        .and_then(|m| m.map_err(|e| dbus::tree::MethodErr::failed(&e.to_string())))
-    {
-        return Err(err);
-    }
+        .and_then(|m| m.map_err(|e| dbus::tree::MethodErr::failed(&e.to_string())))?;
 
-    Ok(())
+    Ok(res)
 }
 
 pub(crate) fn start_command_worker() -> Result<CommandWorkerContext, Error> {
     let (command_tx, command_rx) = mpsc::channel();
-    let (response_tx, response_rx) = crossbeam_channel::unbounded::<Result<(), Error>>();
+    let (response_tx, response_rx) = crossbeam_channel::unbounded::<Result<MixerResponse, Error>>();
     let (join_signal_tx, join_signal_rx) = mpsc::channel();
 
     let (tx, worker_status_rx) = mpsc::channel();
@@ -196,6 +202,26 @@ pub(crate) fn start_command_worker() -> Result<CommandWorkerContext, Error> {
                                 )?;
 
                                 Ok(vec![m.msg.method_return()])
+                            }
+                        }
+                    }))
+                    .add_m(f.method(DbusRoute::GetState.to_string(), (), {
+                        {
+                            let command_tx = command_tx.clone();
+                            let response_rx = response_rx.clone();
+                            move |m| {
+                                let meta = match handle_mixer_command(
+                                    &command_tx,
+                                    &response_rx,
+                                    MixerCommand::GetState,
+                                )? {
+                                    MixerResponse::STATE(data) => data,
+                                    _ => return Err(generic_dbus_error()),
+                                };
+
+                                let msg = m.msg.method_return().append1(&meta);
+
+                                Ok(vec![msg])
                             }
                         }
                     })),
