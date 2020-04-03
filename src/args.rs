@@ -7,12 +7,14 @@ pub(crate) struct Args {
     pub strip_name: Option<String>,
     pub gain_factor: Option<i32>,
     pub add_strip: bool,
+    pub remove_strip: bool,
 }
 
 enum ArgFields {
     StripName,
     GainFactor,
     AddStrip,
+    RemoveStrip,
 }
 
 impl ArgFields {
@@ -21,6 +23,7 @@ impl ArgFields {
             ArgFields::StripName => "StripName",
             ArgFields::GainFactor => "GainFactor",
             ArgFields::AddStrip => "AddStrip",
+            ArgFields::RemoveStrip => "RemoveStrip",
         }
     }
 }
@@ -52,6 +55,12 @@ pub(crate) fn get_args() -> Result<Args, Error> {
                 .long("add-strip")
                 .help("Adds a new strip"),
         )
+        .arg(
+            clap::Arg::with_name(ArgFields::RemoveStrip.to_string())
+                .short('r')
+                .long("remove-strip")
+                .help("Removes an existing strip"),
+        )
         .get_matches();
 
     let mut args = Args {
@@ -59,6 +68,7 @@ pub(crate) fn get_args() -> Result<Args, Error> {
             .value_of(ArgFields::StripName.to_string())
             .map(String::from),
         add_strip: matches.is_present(ArgFields::AddStrip.to_string()),
+        remove_strip: matches.is_present(ArgFields::RemoveStrip.to_string()),
         gain_factor: None,
     };
 

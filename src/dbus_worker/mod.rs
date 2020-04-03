@@ -20,6 +20,7 @@ const DBUS_PATH: &'static str = "com.jackAutoconnect.jackAutoconnect";
 enum DbusRoute {
     InstanceRunning,
     AddStrip,
+    RemoveStrip,
     SetGainFactor,
 }
 
@@ -27,8 +28,9 @@ impl DbusRoute {
     fn to_string(&self) -> &'static str {
         match *self {
             DbusRoute::InstanceRunning => "InstanceRunning",
-            DbusRoute::AddStrip => "AddStrip",
             DbusRoute::SetGainFactor => "SetGainFactor",
+            DbusRoute::AddStrip => "AddStrip",
+            DbusRoute::RemoveStrip => "RemoveStrip",
         }
     }
 }
@@ -64,6 +66,15 @@ pub(crate) fn connect_dbus(args: args::Args) -> Result<Option<()>, Error> {
     } = args
     {
         proxy.method_call(DBUS_PATH, DbusRoute::AddStrip.to_string(), (name,))?;
+    }
+
+    if let Args {
+        strip_name: Some(ref name),
+        remove_strip: true,
+        ..
+    } = args
+    {
+        proxy.method_call(DBUS_PATH, DbusRoute::RemoveStrip.to_string(), (name,))?;
     }
 
     Ok(Some(()))
@@ -162,6 +173,23 @@ pub(crate) fn start_command_worker() -> Result<CommandWorkerContext, Error> {
                                     &command_tx,
                                     &response_rx,
                                     MixerCommand::AddStrip(name.to_owned()),
+                                )?;
+
+                                Ok(vec![m.msg.method_return()])
+                            }
+                        }
+                    }))
+                    .add_m(f.method(DbusRoute::RemoveStrip.to_string(), (), {
+                        {
+                            let command_tx = command_tx.clone();
+                            let response_rx = response_rx.clone();
+                            move |m| {
+                                let name: &str = m.msg.read1()?;
+
+                                handle_mixer_command(
+                                    &command_tx,
+                                    &response_rx,
+                                    MixerCommand::RemoveStrip(name.to_owned()),
                                 )?;
 
                                 Ok(vec![m.msg.method_return()])

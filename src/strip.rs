@@ -21,6 +21,11 @@ impl Strip {
         Ok(ret)
     }
 
+    pub fn destroy(mut self, client: &jack::Client) -> Result<(), Error> {
+        &mut self.set_channels(0, client)?;
+        Ok(())
+    }
+
     pub fn add_channel(&mut self, client: &jack::Client) -> Result<(), Error> {
         let id = self.channels.len() + 1;
         self.channels.push((
@@ -38,8 +43,8 @@ impl Strip {
     }
 
     pub(crate) fn remove_channel(&mut self, client: &jack::Client) -> Result<(), Error> {
-        if self.channels.len() == 1 {
-            return Err(err_msg("cannot unregister last channel"));
+        if self.channels.len() == 0 {
+            return Err(err_msg("no channels left to remove on strip"));
         }
 
         let (in_port, out_port) = self.channels.pop().unwrap();
@@ -56,8 +61,8 @@ impl Strip {
         client: &jack::Client,
     ) -> Result<(), Error> {
         let num_channels = match num_channels {
-            n @ 1..=100 => n as usize,
-            _ => return Err(err_msg("a can have 1-100 channels")),
+            n @ 0..=100 => n as usize,
+            _ => return Err(err_msg("a strip must have 0-100 channels")),
         };
 
         while self.channels.len() > num_channels {

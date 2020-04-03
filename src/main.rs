@@ -23,6 +23,7 @@ use strip::Strip;
 
 pub enum MixerCommand {
     AddStrip(String),
+    RemoveStrip(String),
     SetGainFactor(String, f32),
 }
 
@@ -38,6 +39,18 @@ impl AppState {
 
         let strip = Strip::new(name.clone(), client)?;
         self.strips.insert(name, strip);
+
+        Ok(())
+    }
+
+    pub fn remove_strip(&mut self, name: String, client: &jack::Client) -> Result<(), Error> {
+        if !self.strips.contains_key(&name) {
+            return Err(err_msg(format!("strip '{}' does not exist exists", name)));
+        }
+
+        let (.., strip) = self.strips.remove_entry(&name).unwrap();
+
+        strip.destroy(client)?;
 
         Ok(())
     }
@@ -115,12 +128,6 @@ fn main() -> Result<(), Error> {
         client: &jack::Client,
     ) -> Result<(), Error> {
         match cmd {
-            MixerCommand::AddStrip(name) => {
-                app_state
-                    .lock()
-                    .map_err(|_| err_msg("internal"))?
-                    .add_strip(name.to_owned(), client)?;
-            }
             MixerCommand::SetGainFactor(name, gain_factor) => {
                 app_state
                     .lock()
@@ -131,6 +138,18 @@ fn main() -> Result<(), Error> {
                         name: String::from(name),
                     })?
                     .gain_factor = *gain_factor;
+            }
+            MixerCommand::AddStrip(name) => {
+                app_state
+                    .lock()
+                    .map_err(|_| err_msg("internal"))?
+                    .add_strip(name.to_owned(), client)?;
+            }
+            MixerCommand::RemoveStrip(name) => {
+                app_state
+                    .lock()
+                    .map_err(|_| err_msg("internal"))?
+                    .remove_strip(name.to_owned(), client)?;
             }
         };
         Ok(())
