@@ -76,6 +76,26 @@ pub struct CommandWorkerContext {
     pub response_tx: crossbeam_channel::Sender<Result<(), Error>>,
 }
 
+fn handle_mixer_command(
+    command_tx: &mpsc::Sender<MixerCommand>,
+    response_rx: &crossbeam_channel::Receiver<Result<(), Error>>,
+    command: MixerCommand,
+) -> Result<(), dbus::tree::MethodErr> {
+    if command_tx.send(command).is_err() {
+        return Err(generic_dbus_error());
+    }
+
+    if let Err(err) = response_rx
+        .recv()
+        .map_err(|_| generic_dbus_error())
+        .and_then(|m| m.map_err(|e| dbus::tree::MethodErr::failed(&e.to_string())))
+    {
+        return Err(err);
+    }
+
+    Ok(())
+}
+
 pub(crate) fn start_command_worker() -> Result<CommandWorkerContext, Error> {
     let (command_tx, command_rx) = mpsc::channel();
     let (response_tx, response_rx) = crossbeam_channel::unbounded::<Result<(), Error>>();
@@ -121,22 +141,11 @@ pub(crate) fn start_command_worker() -> Result<CommandWorkerContext, Error> {
                                     n => return Err(dbus::tree::MethodErr::invalid_arg(&n)),
                                 };
 
-                                if command_tx
-                                    .send(MixerCommand::SetGainFactor(name.to_owned(), gain))
-                                    .is_err()
-                                {
-                                    return Err(generic_dbus_error());
-                                }
-
-                                if let Err(err) = response_rx
-                                    .recv()
-                                    .map_err(|_| generic_dbus_error())
-                                    .and_then(|m| {
-                                        m.map_err(|e| dbus::tree::MethodErr::failed(&e.to_string()))
-                                    })
-                                {
-                                    return Err(err);
-                                }
+                                handle_mixer_command(
+                                    &command_tx,
+                                    &response_rx,
+                                    MixerCommand::SetGainFactor(name.to_owned(), gain),
+                                )?;
 
                                 Ok(vec![m.msg.method_return()])
                             }
@@ -149,22 +158,11 @@ pub(crate) fn start_command_worker() -> Result<CommandWorkerContext, Error> {
                             move |m| {
                                 let name: &str = m.msg.read1()?;
 
-                                if command_tx
-                                    .send(MixerCommand::AddStrip(name.to_owned()))
-                                    .is_err()
-                                {
-                                    return Err(generic_dbus_error());
-                                }
-
-                                if let Err(err) = response_rx
-                                    .recv()
-                                    .map_err(|_| generic_dbus_error())
-                                    .and_then(|m| {
-                                        m.map_err(|e| dbus::tree::MethodErr::failed(&e.to_string()))
-                                    })
-                                {
-                                    return Err(err);
-                                }
+                                handle_mixer_command(
+                                    &command_tx,
+                                    &response_rx,
+                                    MixerCommand::AddStrip(name.to_owned()),
+                                )?;
 
                                 Ok(vec![m.msg.method_return()])
                             }
