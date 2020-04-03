@@ -22,9 +22,10 @@ use std::sync::{Arc, Mutex};
 use strip::Strip;
 
 pub enum MixerCommand {
+    SetGainFactor(String, f32),
     AddStrip(String),
     RemoveStrip(String),
-    SetGainFactor(String, f32),
+    SetStrips(String, i32),
     GetState,
 }
 
@@ -174,6 +175,17 @@ fn main() -> Result<(), Error> {
                     ));
                 }
                 return Ok(MixerResponse::STATE(strip_meta));
+            }
+            MixerCommand::SetStrips(name, count) => {
+                app_state
+                    .lock()
+                    .map_err(|_| MixerCommandError::Internal)?
+                    .strips
+                    .get_mut(name)
+                    .ok_or(MixerCommandError::UnknownStrip {
+                        name: String::from(name),
+                    })?
+                    .set_channels(*count, client)?;
             }
         };
         Ok(MixerResponse::EMPTY)

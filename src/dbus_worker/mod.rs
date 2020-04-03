@@ -19,9 +19,10 @@ const DBUS_PATH: &'static str = "com.jackAutoconnect.jackAutoconnect";
 
 enum DbusRoute {
     InstanceRunning,
+    SetGainFactor,
     AddStrip,
     RemoveStrip,
-    SetGainFactor,
+    SetStrips,
     GetState,
 }
 
@@ -33,6 +34,7 @@ impl DbusRoute {
             DbusRoute::AddStrip => "AddStrip",
             DbusRoute::RemoveStrip => "RemoveStrip",
             DbusRoute::GetState => "GetState",
+            DbusRoute::SetStrips => "SetStrips",
         }
     }
 }
@@ -79,6 +81,16 @@ pub(crate) fn connect_dbus(args: args::Args) -> Result<Option<()>, Error> {
     } = args
     {
         proxy.method_call(DBUS_PATH, DbusRoute::RemoveStrip.to_string(), (name,))?;
+        return Ok(Some(()));
+    }
+
+    if let Args {
+        strip_name: Some(ref name),
+        set_strips: Some(count),
+        ..
+    } = args
+    {
+        proxy.method_call(DBUS_PATH, DbusRoute::SetStrips.to_string(), (name, count))?;
         return Ok(Some(()));
     }
 
@@ -222,6 +234,23 @@ pub(crate) fn start_command_worker() -> Result<CommandWorkerContext, Error> {
                                 let msg = m.msg.method_return().append1(&meta);
 
                                 Ok(vec![msg])
+                            }
+                        }
+                    }))
+                    .add_m(f.method(DbusRoute::SetStrips.to_string(), (), {
+                        {
+                            let command_tx = command_tx.clone();
+                            let response_rx = response_rx.clone();
+                            move |m| {
+                                let (name, count): (String, i32) = m.msg.read2()?;
+
+                                handle_mixer_command(
+                                    &command_tx,
+                                    &response_rx,
+                                    MixerCommand::SetStrips(name, count),
+                                )?;
+
+                                Ok(vec![m.msg.method_return()])
                             }
                         }
                     })),
