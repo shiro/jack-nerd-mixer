@@ -14,7 +14,7 @@ extern crate jack;
 
 use errors::MixerCommandError;
 use failure::err_msg;
-use failure::{Error, Fail};
+use failure::Error;
 use std::borrow::BorrowMut;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;

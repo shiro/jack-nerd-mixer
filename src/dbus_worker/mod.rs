@@ -1,4 +1,4 @@
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -94,6 +94,7 @@ pub(crate) fn connect_dbus(args: args::Args) -> Result<Option<()>, Error> {
         return Ok(Some(()));
     }
 
+    // print current state
     let (res,): (Vec<String>,) =
         proxy.method_call(DBUS_PATH, DbusRoute::GetState.to_string(), ())?;
 

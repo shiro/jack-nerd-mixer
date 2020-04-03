@@ -2,7 +2,7 @@ use failure::err_msg;
 use failure::Error;
 
 pub(crate) struct Strip {
-    name: String,
+    pub(crate) name: String,
     pub(crate) gain_factor: f32,
     pub(crate) channels: Vec<(jack::Port<jack::AudioIn>, jack::Port<jack::AudioOut>)>,
 }
