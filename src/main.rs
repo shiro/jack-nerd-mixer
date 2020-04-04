@@ -1,5 +1,6 @@
 #![feature(type_ascription)]
 #![feature(bool_to_option)]
+#![feature(type_alias_impl_trait)]
 
 pub mod args;
 pub mod dbus_worker;
@@ -12,20 +13,23 @@ extern crate dbus;
 extern crate failure;
 extern crate jack;
 
+use crate::jack_internal::IgnoreNotifications;
+use crate::strip::Strip;
 use errors::MixerCommandError;
 use failure::err_msg;
 use failure::Error;
+use jack::{Client, Control, ProcessScope};
 use std::borrow::BorrowMut;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use strip::Strip;
+use strip::StripState;
 
 pub enum MixerCommand {
     SetGainFactor(String, f32),
     AddStrip(String),
     RemoveStrip(String),
-    SetStrips(String, i32),
+    SetChannels(String, i32),
     GetState,
 }
 
@@ -34,32 +38,58 @@ pub enum MixerResponse {
     STATE(Vec<String>),
 }
 
-struct AppState {
-    strips: HashMap<String, Strip>,
+// impl AppState {
+//     pub fn add_strip(&mut self, name: String, client: &jack::Client) -> Result<(), Error> {
+//         if self.strips.contains_key(&name) {
+//             return Err(err_msg("strip already exists"));
+//         }
+//
+//         let strip = StripState::new(name.clone(), client)?;
+//         self.strips.insert(name, strip);
+//
+//         Ok(())
+//     }
+//
+//     pub fn remove_strip(&mut self, name: String, client: &jack::Client) -> Result<(), Error> {
+//         if !self.strips.contains_key(&name) {
+//             return Err(err_msg(format!("strip '{}' does not exist exists", name)));
+//         }
+//
+//         let (.., strip) = self.strips.remove_entry(&name).unwrap();
+//
+//         strip.destroy(client)?;
+//
+//         Ok(())
+//     }
+// }
+
+struct ProcessorContext {
+    state: Arc<Mutex<StripState>>,
 }
 
-impl AppState {
-    pub fn add_strip(&mut self, name: String, client: &jack::Client) -> Result<(), Error> {
-        if self.strips.contains_key(&name) {
-            return Err(err_msg("strip already exists"));
+impl jack::ProcessHandler for ProcessorContext {
+    fn process(&mut self, _: &Client, ps: &ProcessScope) -> Control {
+        let mut app_state = match self.state.lock() {
+            Ok(state) => state,
+            _ => return jack::Control::Continue,
+        };
+
+        let gain_factor = app_state.gain_factor;
+
+        for (from, to) in app_state
+            .channels
+            .iter_mut()
+            .map(|(from, to)| (from.as_slice(ps), to.as_mut_slice(ps)))
+        {
+            let len = to.len();
+            let src = &from[..len];
+
+            for i in 0..len {
+                to[i] = src[i].clone() * gain_factor;
+            }
         }
 
-        let strip = Strip::new(name.clone(), client)?;
-        self.strips.insert(name, strip);
-
-        Ok(())
-    }
-
-    pub fn remove_strip(&mut self, name: String, client: &jack::Client) -> Result<(), Error> {
-        if !self.strips.contains_key(&name) {
-            return Err(err_msg(format!("strip '{}' does not exist exists", name)));
-        }
-
-        let (.., strip) = self.strips.remove_entry(&name).unwrap();
-
-        strip.destroy(client)?;
-
-        Ok(())
+        jack::Control::Continue
     }
 }
 
@@ -75,20 +105,6 @@ fn main() -> Result<(), Error> {
         });
     }
 
-    // TODO fail
-    let (mut client, _) =
-        jack::Client::new("jack-rust-mixer", jack::ClientOptions::NO_START_SERVER).unwrap();
-
-    let app_state = Arc::new(Mutex::new(AppState {
-        strips: HashMap::new(),
-    }));
-
-    // TODO fail
-    app_state.lock().unwrap().strips.insert(
-        String::from("music"),
-        Strip::new(String::from("music"), client.borrow_mut()).unwrap(),
-    );
-
     if let Some(_) = dbus_worker::connect_dbus(args)? {
         // another instance is running, we finished client work
         return Ok(());
@@ -97,95 +113,55 @@ fn main() -> Result<(), Error> {
     let command_worker_context =
         dbus_worker::start_command_worker().expect("error: failed to start dbus service");
 
-    let jack_process_callback = {
-        let app_state = app_state.clone();
-        move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
-            let mut app_state = match app_state.lock() {
-                Ok(state) => state,
-                _ => return jack::Control::Continue,
-            };
-            for strip in &mut app_state.strips.values_mut() {
-                for (from, to) in strip
-                    .channels
-                    .iter_mut()
-                    .map(|(from, to)| (from.as_slice(ps), to.as_mut_slice(ps)))
-                {
-                    let len = to.len();
-                    let src = &from[..len];
+    let strip = Strip::new("music".to_owned())?;
 
-                    for i in 0..len {
-                        to[i] = src[i].clone() * strip.gain_factor;
-                    }
-                }
-            }
-
-            jack::Control::Continue
-        }
-    };
-
-    let jack_process_callback = jack::ClosureProcessHandler::new(jack_process_callback);
-
-    let active_client = client
-        .activate_async(jack_internal::Notifications, jack_process_callback)
-        .unwrap();
+    let mut strips = HashMap::new();
+    let _ = strips.insert("music".to_owned(), strip);
 
     fn process_commands(
         cmd: &MixerCommand,
-        app_state: Arc<Mutex<AppState>>,
-        client: &jack::Client,
+        strips: &mut HashMap<String, Strip>,
     ) -> Result<MixerResponse, Error> {
         match cmd {
             MixerCommand::SetGainFactor(name, gain_factor) => {
-                app_state
-                    .lock()
-                    .map_err(|_| MixerCommandError::Internal)?
-                    .strips
+                strips
                     .get_mut(name)
                     .ok_or(MixerCommandError::UnknownStrip {
-                        name: String::from(name),
+                        name: name.to_owned(),
                     })?
-                    .gain_factor = *gain_factor;
+                    .set_gain_factor(*gain_factor)?;
             }
             MixerCommand::AddStrip(name) => {
-                app_state
-                    .lock()
-                    .map_err(|_| MixerCommandError::Internal)?
-                    .add_strip(name.to_owned(), client)?;
+                let strip = Strip::new(name.clone())?;
+                strips.insert(name.clone(), strip);
             }
             MixerCommand::RemoveStrip(name) => {
-                app_state
-                    .lock()
-                    .map_err(|_| MixerCommandError::Internal)?
-                    .remove_strip(name.to_owned(), client)?;
+                let strip = strips
+                    .remove(name)
+                    .ok_or(MixerCommandError::UnknownStrip { name: name.clone() })?;
+
+                strip.destroy()?;
             }
             MixerCommand::GetState => {
                 let mut strip_meta = vec![];
 
-                for (ch_name, strip) in app_state
-                    .lock()
-                    .map_err(|_| MixerCommandError::Internal)?
-                    .strips
-                    .iter()
-                {
+                for (ch_name, strip) in strips.iter() {
                     strip_meta.push(format!(
                         "{}: channels: {} gain-factor: {}",
                         ch_name,
-                        strip.channels.len(),
-                        strip.gain_factor
+                        strip.get_channels()?,
+                        strip.get_gain_factor()?,
                     ));
                 }
                 return Ok(MixerResponse::STATE(strip_meta));
             }
-            MixerCommand::SetStrips(name, count) => {
-                app_state
-                    .lock()
-                    .map_err(|_| MixerCommandError::Internal)?
-                    .strips
+            MixerCommand::SetChannels(name, count) => {
+                strips
                     .get_mut(name)
                     .ok_or(MixerCommandError::UnknownStrip {
-                        name: String::from(name),
+                        name: name.to_owned(),
                     })?
-                    .set_channels(*count, client)?;
+                    .set_channels(*count)?;
             }
         };
         Ok(MixerResponse::EMPTY)
@@ -193,12 +169,18 @@ fn main() -> Result<(), Error> {
 
     while !stopped.load(std::sync::atomic::Ordering::SeqCst) {
         if let Ok(cmd) = command_worker_context.command_rx.try_recv() {
-            let res = process_commands(&cmd, app_state.clone(), active_client.as_client());
+            let res = process_commands(&cmd, &mut strips);
             command_worker_context.response_tx.send(res)?;
         }
     }
 
-    active_client.deactivate()?;
+    let names: Vec<String> = strips.keys().map(String::to_owned).collect();
+
+    for name in names {
+        if let Some(strip) = strips.remove(&name) {
+            strip.destroy()?;
+        }
+    }
 
     command_worker_context.join_signal_tx.send(())?;
     command_worker_context.join_handle.join().unwrap();

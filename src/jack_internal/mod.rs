@@ -1,5 +1,5 @@
 pub mod notifications;
 
-pub(crate) struct Notifications;
+pub(crate) struct IgnoreNotifications;
 
-impl jack::NotificationHandler for Notifications {}
+impl jack::NotificationHandler for IgnoreNotifications {}

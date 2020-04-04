@@ -248,7 +248,7 @@ pub(crate) fn start_command_worker() -> Result<CommandWorkerContext, Error> {
                                 handle_mixer_command(
                                     &command_tx,
                                     &response_rx,
-                                    MixerCommand::SetStrips(name, count),
+                                    MixerCommand::SetChannels(name, count),
                                 )?;
 
                                 Ok(vec![m.msg.method_return()])
