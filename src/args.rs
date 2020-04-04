@@ -87,7 +87,13 @@ pub(crate) fn get_args() -> Result<Args, Error> {
     if matches.is_present(ArgFields::GainFactor.to_string()) {
         args.gain_factor = value_t!(matches, ArgFields::GainFactor.to_string(), i32)
             .ok()
-            .and_then(|n| if (0..200).contains(&n) { Some(n) } else { None })
+            .and_then(|n| {
+                if (0..=200).contains(&n) {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
             .map(Some)
             .ok_or_else(|| err_msg("gain factor needs to be a number (0..200)"))?;
     }
